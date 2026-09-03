@@ -4,22 +4,18 @@ from genlayer import *
 import json
 import re
 import typing
+import hashlib
 from datetime import datetime, timezone
 from dataclasses import dataclass
 
-# Limits - 32MB to handle large web pages safely
 MAX_ID_LENGTH = 64
 MAX_URL_LENGTH = 512
-MAX_DOC_BYTES = 33554432  # 32 MB
-MAX_MODEL_OUTPUT = 2048
+MAX_DOC_BYTES = 33554432
 
-# Verdict Enums
 VERDICT_INFRINGEMENT = "INFRINGEMENT_FOUND"
 VERDICT_CLEARED = "CLEARED"
 VERDICT_UNRESOLVED = "UNRESOLVED"
-ALLOWED_VERDICTS = {VERDICT_INFRINGEMENT, VERDICT_CLEARED, VERDICT_UNRESOLVED}
 
-# Lifecycle States
 STATE_REGISTERED = "REGISTERED"
 STATE_DISPUTED = "DISPUTED"
 STATE_RESOLVED = "RESOLVED"
@@ -43,7 +39,6 @@ class DisputeCase:
     verdict: str
     resolution_date: u32
 
-
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise gl.vm.UserError(message)
@@ -60,26 +55,13 @@ def _validate_url(url: str) -> str:
     _require(url.startswith("https://"), "URL must strictly use HTTPS")
     return url
 
-def _fetch_document(url: str) -> str:
-    response = gl.nondet.web.get(url)
-    status = getattr(response, "status", getattr(response, "status_code", None))
-    
-    if status != 200 or response.body is None:
-        raise gl.vm.UserError(f"Failed to retrieve document from {url}")
-
-    body = response.body if isinstance(response.body, bytes) else response.body.encode("utf-8")
-    
-    if len(body) > MAX_DOC_BYTES:
-        raise gl.vm.UserError("Document size exceeds maximum allowed bytes")
-
-    return body.decode("utf-8")
-
-
 class CopyrightTribunal(gl.Contract):
     assets: TreeMap[str, CopyrightAsset]
     disputes: TreeMap[str, DisputeCase]
 
     def __init__(self):
+        # GenVM automatically initializes Storage variables (like TreeMap and DynArray),
+        # so manual initialization is not needed.
         pass
 
     def _get_timestamp(self) -> u32:
@@ -137,10 +119,56 @@ class CopyrightTribunal(gl.Contract):
 
         original_url_copy = asset.original_url
         claimant_url_copy = dispute.claimant_url
+        expected_hash = asset.content_hash
 
         def leader_fn() -> str:
-            original_text = _fetch_document(original_url_copy)
-            claimant_text = _fetch_document(claimant_url_copy)
+            # Internal helper mapped safely inside the non-deterministic block
+            def fetch_doc_internal(url: str) -> str:
+                try:
+                    response = gl.nondet.web.get(url)
+                    status = getattr(response, "status", getattr(response, "status_code", None))
+                    
+                    if status != 200 or response.body is None:
+                        return f"[FETCH_ERROR_STATUS_{status}]"
+
+                    body = response.body
+                    if not isinstance(body, bytes):
+                        body = str(body).encode("utf-8")
+                    
+                    if len(body) > MAX_DOC_BYTES:
+                        return "[FETCH_ERROR_TOO_LARGE]"
+
+                    return body.decode("utf-8", errors="ignore")
+                except Exception:
+                    return "[FETCH_ERROR_EXCEPTION]"
+
+            original_text = fetch_doc_internal(original_url_copy)
+            
+            if original_text.startswith("[FETCH_ERROR_"):
+                return json.dumps({
+                    "similarity_score": 0,
+                    "verdict": VERDICT_UNRESOLVED,
+                    "reasoning": "Original content unavailable due to network/server errors."
+                }, separators=(",", ":"), sort_keys=True)
+
+            # Programmatically check the original content hash
+            current_hash = hashlib.sha256(original_text.encode('utf-8')).hexdigest()
+            
+            if current_hash != expected_hash:
+                return json.dumps({
+                    "similarity_score": 0,
+                    "verdict": VERDICT_CLEARED,
+                    "reasoning": "Original content hash mismatch. The registered content has been tampered with."
+                }, separators=(",", ":"), sort_keys=True)
+
+            claimant_text = fetch_doc_internal(claimant_url_copy)
+            
+            if claimant_text.startswith("[FETCH_ERROR_"):
+                return json.dumps({
+                    "similarity_score": 0,
+                    "verdict": VERDICT_UNRESOLVED,
+                    "reasoning": "Claimant content unavailable due to network/server errors."
+                }, separators=(",", ":"), sort_keys=True)
 
             prompt = f"""
             You are a strict Copyright and Plagiarism Arbitrator.
@@ -155,59 +183,58 @@ class CopyrightTribunal(gl.Contract):
             Evaluate the structural and semantic similarity.
             Return a JSON object with EXACTLY these keys:
             - "similarity_score": Integer from 0 to 100 representing percentage of copied content.
-            - "verdict": If score > 30, return "INFRINGEMENT_FOUND". Otherwise return "CLEARED".
             - "reasoning": A brief explanation of the overlapping patterns.
             
-            Output ONLY valid JSON. No markdown formatting, no code blocks.
+            Output ONLY valid JSON.
             """
+            
             model_out = gl.nondet.exec_prompt(prompt, response_format="json")
             
-            try:
-                # دیباگ ۱: بررسی نوع خروجی مدل (جلوگیری از خطای dict object has no attribute strip)
-                if isinstance(model_out, dict):
-                    data = model_out
-                else:
-                    cleaned_out = str(model_out).strip()
-                    if cleaned_out.startswith("```"):
-                        cleaned_out = re.sub(r"^```(?:json)?\s*", "", cleaned_out)
-                        cleaned_out = re.sub(r"\s*```$", "", cleaned_out)
-                    
-                    first_brace = cleaned_out.find("{")
-                    last_brace = cleaned_out.rfind("}")
-                    if first_brace != -1 and last_brace != -1:
-                        cleaned_out = cleaned_out[first_brace:last_brace + 1]
-
-                    data = json.loads(cleaned_out)
-
-                score = int(data.get("similarity_score", 0))
-                verdict = str(data.get("verdict", VERDICT_UNRESOLVED))
+            if not isinstance(model_out, dict):
+                raise gl.vm.UserError("LLM did not return a valid dictionary structure.")
                 
-                if verdict not in ALLOWED_VERDICTS:
-                    verdict = VERDICT_UNRESOLVED
-                    
-                normalized = json.dumps({
-                    "similarity_score": max(0, min(100, score)),
-                    "verdict": verdict
+            try:
+                raw_score = model_out.get("similarity_score", 0)
+                score = int(str(raw_score).strip())
+                score = max(0, min(100, score))
+                
+                # Enforce the decision rule programmatically
+                calculated_verdict = VERDICT_INFRINGEMENT if score > 30 else VERDICT_CLEARED
+                
+                return json.dumps({
+                    "similarity_score": score,
+                    "verdict": calculated_verdict,
+                    "reasoning": str(model_out.get("reasoning", ""))
                 }, separators=(",", ":"), sort_keys=True)
-                return normalized
                 
             except Exception as e:
-                raise gl.vm.UserError(f"LLM output parsing failed: {str(e)}")
+                raise gl.vm.UserError(f"LLM output structure invalid: {str(e)}")
 
         def validator_fn(leader_result: typing.Any) -> bool:
             if not isinstance(leader_result, gl.vm.Return):
-                return False
+                leader_msg = getattr(leader_result, 'message', str(leader_result))
+                try:
+                    leader_fn()
+                    return False
+                except gl.vm.UserError as e:
+                    validator_msg = getattr(e, 'message', str(e))
+                    return validator_msg == leader_msg
+                except Exception:
+                    return False
                 
             try:
                 validator_json = leader_fn()
                 val_data = json.loads(validator_json)
                 lead_data = json.loads(leader_result.calldata)
 
+                # The final verdict must match exactly
                 if val_data["verdict"] != lead_data["verdict"]:
                     return False
 
                 val_score = val_data["similarity_score"]
                 lead_score = lead_data["similarity_score"]
+                
+                # 5% tolerance for non-deterministic AI scoring differences
                 if abs(val_score - lead_score) > 5:
                     return False
 
@@ -222,28 +249,35 @@ class CopyrightTribunal(gl.Contract):
         
         dispute.similarity_score = u8(consensus_data["similarity_score"])
         dispute.verdict = final_verdict
-        dispute.resolution_date = self._get_timestamp()
+        
+        if final_verdict != VERDICT_UNRESOLVED:
+            dispute.resolution_date = self._get_timestamp()
+            asset.state = STATE_RESOLVED
+            self.assets[asset_id] = asset
+
         self.disputes[dispute_id] = dispute
 
-        asset.state = STATE_RESOLVED
-        self.assets[asset_id] = asset
-
     @gl.public.view
-    def get_asset_status(self, asset_id: str) -> dict:
+    def get_asset_status(self, asset_id: str) -> dict[str, str]:
         _require(asset_id in self.assets, "Asset not found")
         a = self.assets[asset_id]
         return {
             "owner": str(a.owner),
+            "original_url": a.original_url,
+            "content_hash": a.content_hash,
+            "registration_date": str(a.registration_date),
             "state": a.state,
             "active_dispute_id": a.active_dispute_id
         }
 
     @gl.public.view
-    def get_dispute_verdict(self, dispute_id: str) -> dict:
+    def get_dispute_verdict(self, dispute_id: str) -> dict[str, str]:
         _require(dispute_id in self.disputes, "Dispute not found")
         d = self.disputes[dispute_id]
         return {
-            "similarity_score": int(d.similarity_score),
+            "claimant": str(d.claimant),
+            "claimant_url": d.claimant_url,
+            "similarity_score": str(d.similarity_score),
             "verdict": d.verdict,
-            "resolution_date": int(d.resolution_date)
+            "resolution_date": str(d.resolution_date)
         }
